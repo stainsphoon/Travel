@@ -64,12 +64,53 @@ type EditorBlock =
   | { id: string; type: "text"; value: string }
   | { id: string; type: "imageStack"; uris: string[]; offsetX: number; offsetY: number };
 
+const MEDIA_REF_PREFIX = "mediaref:";
+
 function isRenderableImageUri(uri: string) {
   return /^(file|content|https?|data):\/\//i.test(uri);
 }
 
+function encodeMediaRef(assetId: string, fallbackUri?: string) {
+  if (!assetId) return fallbackUri ?? "";
+  if (!fallbackUri) return `assetid:${assetId}`;
+  return `${MEDIA_REF_PREFIX}${encodeURIComponent(assetId)}::${encodeURIComponent(fallbackUri)}`;
+}
+
+function decodeMediaRef(uri: string) {
+  if (!uri.startsWith(MEDIA_REF_PREFIX)) return null;
+  const payload = uri.slice(MEDIA_REF_PREFIX.length);
+  const separator = payload.indexOf("::");
+  if (separator < 0) {
+    const assetId = decodeURIComponent(payload);
+    return assetId ? { assetId, fallbackUri: null as string | null } : null;
+  }
+  const assetId = decodeURIComponent(payload.slice(0, separator));
+  const fallbackUri = decodeURIComponent(payload.slice(separator + 2));
+  return assetId ? { assetId, fallbackUri: fallbackUri || null } : null;
+}
+
+function getFallbackRenderableUri(uri: string) {
+  const decoded = decodeMediaRef(uri);
+  if (decoded?.fallbackUri && isRenderableImageUri(decoded.fallbackUri)) {
+    return decoded.fallbackUri;
+  }
+  return isRenderableImageUri(uri) ? uri : null;
+}
+
+function normalizePhotoRef(uri: string) {
+  if (!uri) return uri;
+  if (uri.startsWith(MEDIA_REF_PREFIX)) return uri;
+  const assetId = toAssetCandidates(uri)[0];
+  if (!assetId) return uri;
+  return encodeMediaRef(assetId, getFallbackRenderableUri(uri) ?? undefined);
+}
+
 function toAssetCandidates(uri: string) {
   const candidates: string[] = [];
+  const decoded = decodeMediaRef(uri);
+  if (decoded?.assetId) {
+    candidates.push(decoded.assetId);
+  }
   if (uri.startsWith("assetid:")) {
     candidates.push(uri.slice("assetid:".length));
   }
@@ -154,6 +195,7 @@ export function VoyageScreen() {
   const [themePickerVisible, setThemePickerVisible] = useState(false);
   const [draggingStackId, setDraggingStackId] = useState<string | null>(null);
   const [pressingStackId, setPressingStackId] = useState<string | null>(null);
+  const [stackDeleteTargetId, setStackDeleteTargetId] = useState<string | null>(null);
   const [dropPreview, setDropPreview] = useState<{ id: string; x: number; y: number } | null>(null);
   const [resolvedImageMap, setResolvedImageMap] = useState<Record<string, string>>({});
   const [photoPickerAnchor, setPhotoPickerAnchor] = useState({ x: width - 20, y: stageHeight });
@@ -174,16 +216,18 @@ export function VoyageScreen() {
     id: null,
     selection: { start: 0, end: 0 },
   });
-  const stackDragRef = useRef<{ id: string | null; startX: number; startY: number; baseX: number; baseY: number; armed: boolean; moved: boolean }>({
+  const stackDragRef = useRef<{ id: string | null; startX: number; startY: number; baseX: number; baseY: number; armed: boolean; holdReady: boolean; moved: boolean }>({
     id: null,
     startX: 0,
     startY: 0,
     baseX: 0,
     baseY: 0,
     armed: false,
+    holdReady: false,
     moved: false,
   });
   const stackDragTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reopenGalleryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dragLiftAnim = useRef(new Animated.Value(0)).current;
   const dragOffsetXAnim = useRef(new Animated.Value(0)).current;
   const dragOffsetYAnim = useRef(new Animated.Value(0)).current;
@@ -226,6 +270,15 @@ export function VoyageScreen() {
     void init();
   }, []);
 
+  useEffect(() => {
+    void (async () => {
+      const permission = await MediaLibrary.getPermissionsAsync();
+      if (permission.granted) {
+        setMediaPermissionGranted(true);
+      }
+    })();
+  }, []);
+
   const orderedPages = useMemo(() => [...pages].reverse(), [pages]);
 
   useEffect(() => {
@@ -238,6 +291,9 @@ export function VoyageScreen() {
     return () => {
       if (stackDragTimerRef.current) {
         clearTimeout(stackDragTimerRef.current);
+      }
+      if (reopenGalleryTimerRef.current) {
+        clearTimeout(reopenGalleryTimerRef.current);
       }
     };
   }, []);
@@ -256,9 +312,9 @@ export function VoyageScreen() {
 
   const resolveDisplayUri = useCallback(
     (uri: string) => {
-      if (isRenderableImageUri(uri)) return uri;
       const mapped = resolvedImageMap[uri];
-      return mapped && isRenderableImageUri(mapped) ? mapped : null;
+      if (mapped && isRenderableImageUri(mapped)) return mapped;
+      return getFallbackRenderableUri(uri);
     },
     [resolvedImageMap],
   );
@@ -276,7 +332,12 @@ export function VoyageScreen() {
     galleryPhotoUris.forEach((uri) => refs.add(uri));
     if (zoomPhotoUri) refs.add(zoomPhotoUri);
 
-    const unresolved = Array.from(refs).filter((uri) => !isRenderableImageUri(uri) && !resolvedImageMap[uri]);
+    if (!mediaPermissionGranted) return;
+
+    const unresolved = Array.from(refs).filter((uri) => {
+      if (resolvedImageMap[uri]) return false;
+      return toAssetCandidates(uri).length > 0;
+    });
     if (unresolved.length === 0) return;
     let cancelled = false;
 
@@ -287,10 +348,10 @@ export function VoyageScreen() {
         for (const id of candidates) {
           try {
             const info = await MediaLibrary.getAssetInfoAsync(id, { shouldDownloadFromNetwork: true });
-            const localUri = info?.localUri ?? "";
-            if (localUri && isRenderableImageUri(localUri)) {
+            const candidateUri = info?.localUri ?? info?.uri ?? "";
+            if (candidateUri && isRenderableImageUri(candidateUri)) {
               if (cancelled) return;
-              setResolvedImageMap((prev) => (prev[ref] ? prev : { ...prev, [ref]: localUri }));
+              setResolvedImageMap((prev) => (prev[ref] ? prev : { ...prev, [ref]: candidateUri }));
               break;
             }
           } catch {
@@ -303,7 +364,7 @@ export function VoyageScreen() {
     return () => {
       cancelled = true;
     };
-  }, [contentBlocks, galleryPhotoUris, orderedPages, recentPhotos, resolvedImageMap, zoomPhotoUri]);
+  }, [contentBlocks, galleryPhotoUris, mediaPermissionGranted, orderedPages, recentPhotos, resolvedImageMap, zoomPhotoUri]);
 
   const currentPage = orderedPages.length > 0 ? orderedPages[Math.max(0, Math.min(activePageIndex, orderedPages.length - 1))] : null;
 
@@ -366,14 +427,24 @@ export function VoyageScreen() {
     ]).start();
   };
 
+  const closePhotoViewer = useCallback(() => {
+    if (reopenGalleryTimerRef.current) {
+      clearTimeout(reopenGalleryTimerRef.current);
+      reopenGalleryTimerRef.current = null;
+    }
+    setZoomPhotoVisible(false);
+    setZoomPhotoUri(null);
+    setPhotoGalleryVisible(false);
+    setGalleryPhotoUris([]);
+  }, []);
+
   const closePassport = () => {
     setOpened(false);
     setEditorVisible(false);
     setPlanPickerVisible(false);
     setStampPickerVisible(false);
     setPhotoPickerVisible(false);
-    setPhotoGalleryVisible(false);
-    setZoomPhotoVisible(false);
+    closePhotoViewer();
     Animated.timing(openProgress, {
       toValue: 0,
       duration: 300,
@@ -406,12 +477,14 @@ export function VoyageScreen() {
     setStampPickerVisible(false);
     setPhotoPickerVisible(false);
     setDraftPhotoIds([]);
-    setPhotoGalleryVisible(false);
+    closePhotoViewer();
     setGalleryPhotoUris([]);
-    setZoomPhotoVisible(false);
-    setZoomPhotoUri(null);
     setError(null);
     setPlanPickerVisible(false);
+    setDraggingStackId(null);
+    setPressingStackId(null);
+    setStackDeleteTargetId(null);
+    setDropPreview(null);
   };
 
   const closeStampPicker = () => {
@@ -475,7 +548,7 @@ export function VoyageScreen() {
       const mapped = result.assets
         .map((asset) => ({
           id: asset.id,
-          uri: isRenderableImageUri(asset.uri) ? asset.uri : `assetid:${asset.id}`,
+          uri: encodeMediaRef(asset.id, isRenderableImageUri(asset.uri) ? asset.uri : undefined),
         }))
         .filter((item) => !!item.uri);
       if (activeSession !== photoLoadSessionRef.current) return 0;
@@ -508,7 +581,7 @@ export function VoyageScreen() {
           const patch = chunk
             .map((asset, idx) => ({
               id: asset.id,
-              uri: infoList[idx]?.localUri ?? (isRenderableImageUri(asset.uri) ? asset.uri : ""),
+              uri: encodeMediaRef(asset.id, infoList[idx]?.localUri ?? (isRenderableImageUri(asset.uri) ? asset.uri : undefined)),
             }))
             .filter((item) => !!item.uri);
           if (patch.length === 0) continue;
@@ -720,9 +793,22 @@ export function VoyageScreen() {
     });
   }, []);
 
+  const removeDraftPhoto = useCallback((id: string) => {
+    setDraftPhotoIds((prev) => prev.filter((item) => item !== id));
+  }, []);
+
+  const removeImageStack = useCallback((blockId: string) => {
+    setContentBlocks((prev) => prev.filter((item) => item.id !== blockId));
+    setStackDeleteTargetId((prev) => (prev === blockId ? null : prev));
+    setDraggingStackId((prev) => (prev === blockId ? null : prev));
+    setPressingStackId((prev) => (prev === blockId ? null : prev));
+    setDropPreview((prev) => (prev?.id === blockId ? null : prev));
+  }, []);
+
   const renderPhotoItem = useCallback(
     ({ item }: { item: RecentPhotoItem }) => {
       const displayUri = resolveDisplayUri(item.uri);
+      const selected = selectedPhotoIdSet.has(item.id);
       return (
         <Pressable style={styles.photoPickerItem} onPress={() => toggleRecentPhoto(item.id)}>
           {displayUri ? (
@@ -732,15 +818,27 @@ export function VoyageScreen() {
               <Ionicons name="image-outline" size={20} color="#7B8794" />
             </View>
           )}
-          {selectedPhotoIdSet.has(item.id) ? (
+          {selected ? (
             <View style={styles.photoSelectedMask}>
-              <Ionicons name="checkmark-circle" size={20} color="#FFFFFF" />
+              <Ionicons name="checkmark-circle" size={22} color="#FFFFFF" />
             </View>
+          ) : null}
+          {selected ? (
+            <Pressable
+              style={styles.photoRemoveChip}
+              hitSlop={8}
+              onPress={(event) => {
+                event.stopPropagation();
+                removeDraftPhoto(item.id);
+              }}
+            >
+              <Ionicons name="close" size={12} color="#0F172A" />
+            </Pressable>
           ) : null}
         </Pressable>
       );
     },
-    [resolveDisplayUri, selectedPhotoIdSet, toggleRecentPhoto],
+    [removeDraftPhoto, resolveDisplayUri, selectedPhotoIdSet, toggleRecentPhoto],
   );
 
   const startStackDrag = (blockId: string, pageX: number, pageY: number, baseX: number, baseY: number) => {
@@ -748,16 +846,20 @@ export function VoyageScreen() {
       clearTimeout(stackDragTimerRef.current);
       stackDragTimerRef.current = null;
     }
-    stackDragRef.current = { id: blockId, startX: pageX, startY: pageY, baseX, baseY, armed: false, moved: false };
+    setStackDeleteTargetId(null);
+    stackDragRef.current = { id: blockId, startX: pageX, startY: pageY, baseX, baseY, armed: false, holdReady: false, moved: false };
     setPressingStackId(blockId);
     stackDragTimerRef.current = setTimeout(() => {
-      armStackDrag(blockId);
+      if (stackDragRef.current.id !== blockId) return;
+      stackDragRef.current.holdReady = true;
+      setStackDeleteTargetId(blockId);
     }, DRAG_HOLD_MS);
   };
 
   const armStackDrag = (blockId: string) => {
     if (stackDragRef.current.id !== blockId) return;
     stackDragRef.current.armed = true;
+    setStackDeleteTargetId(null);
     setDraggingStackId(blockId);
     dragOffsetXAnim.setValue(stackDragRef.current.baseX);
     dragOffsetYAnim.setValue(stackDragRef.current.baseY);
@@ -778,6 +880,12 @@ export function VoyageScreen() {
     const dy = pageY - state.startY;
     if (Math.abs(dx) > 14 || Math.abs(dy) > 14) {
       state.moved = true;
+      if (stackDeleteTargetId === state.id) {
+        setStackDeleteTargetId(null);
+      }
+    }
+    if (!state.armed && state.holdReady && state.moved) {
+      armStackDrag(state.id);
     }
     if (!state.armed) return;
     const minX = -editorCanvasSize.width;
@@ -794,20 +902,27 @@ export function VoyageScreen() {
   const openStackGallery = (uris: string[]) => {
     const nextUris = uris.map((uri) => resolveDisplayUri(uri)).filter((uri): uri is string => !!uri);
     if (nextUris.length === 0) return;
+    setStackDeleteTargetId(null);
+    setPressingStackId(null);
+    setDraggingStackId(null);
     setZoomPhotoVisible(false);
     setZoomPhotoUri(null);
     setGalleryPhotoUris(nextUris);
     if (photoGalleryVisible) {
       setPhotoGalleryVisible(false);
-      setTimeout(() => {
+      if (reopenGalleryTimerRef.current) {
+        clearTimeout(reopenGalleryTimerRef.current);
+      }
+      reopenGalleryTimerRef.current = setTimeout(() => {
         setPhotoGalleryVisible(true);
+        reopenGalleryTimerRef.current = null;
       }, 170);
       return;
     }
     setPhotoGalleryVisible(true);
   };
 
-  const endStackDrag = () => {
+  const endStackDrag = (options?: { preserveDeletePrompt?: boolean }) => {
     const state = stackDragRef.current;
     const draggedId = state.id;
     const wasArmed = state.armed;
@@ -831,10 +946,13 @@ export function VoyageScreen() {
       clearTimeout(stackDragTimerRef.current);
       stackDragTimerRef.current = null;
     }
-    stackDragRef.current = { id: null, startX: 0, startY: 0, baseX: 0, baseY: 0, armed: false, moved: false };
+    stackDragRef.current = { id: null, startX: 0, startY: 0, baseX: 0, baseY: 0, armed: false, holdReady: false, moved: false };
     const releaseVisual = () => {
       setDraggingStackId(null);
       setPressingStackId(null);
+      if (!options?.preserveDeletePrompt) {
+        setStackDeleteTargetId(null);
+      }
       Animated.timing(dragLiftAnim, {
         toValue: 0,
         duration: 120,
@@ -854,8 +972,8 @@ export function VoyageScreen() {
 
   const buildStackPanHandlers = (block: Extract<EditorBlock, { type: "imageStack" }>) =>
     PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onMoveShouldSetPanResponder: () => true,
+      onStartShouldSetPanResponder: () => stackDeleteTargetId !== block.id,
+      onMoveShouldSetPanResponder: () => stackDeleteTargetId !== block.id,
       onPanResponderGrant: (event) => {
         startStackDrag(block.id, event.nativeEvent.pageX, event.nativeEvent.pageY, block.offsetX, block.offsetY);
       },
@@ -867,8 +985,9 @@ export function VoyageScreen() {
         if (state.id === block.id && state.armed) {
           moveStackDrag(event.nativeEvent.pageX, event.nativeEvent.pageY);
         }
-        const shouldOpenGallery = state.id === block.id && !state.armed && !state.moved;
-        endStackDrag();
+        const shouldKeepDeletePrompt = state.id === block.id && state.holdReady && !state.armed && !state.moved;
+        const shouldOpenGallery = state.id === block.id && !state.holdReady && !state.armed && !state.moved;
+        endStackDrag({ preserveDeletePrompt: shouldKeepDeletePrompt });
         if (shouldOpenGallery) {
           openStackGallery(block.uris);
         }
@@ -890,7 +1009,9 @@ export function VoyageScreen() {
       chosenAssets.map((item) => MediaLibrary.getAssetInfoAsync(item.id, { shouldDownloadFromNetwork: true }).catch(() => null)),
     );
     const selectedUris = chosenAssets
-      .map((item, idx) => infoList[idx]?.localUri ?? (isRenderableImageUri(item.uri) ? item.uri : `assetid:${item.id}`))
+      .map((item, idx) =>
+        encodeMediaRef(item.id, infoList[idx]?.localUri ?? getFallbackRenderableUri(item.uri) ?? undefined),
+      )
       .filter((uri): uri is string => !!uri);
     if (selectedUris.length === 0) {
       closePhotoPicker();
@@ -981,7 +1102,7 @@ export function VoyageScreen() {
       }
 
       const finalNote = readNoteFromBlocks(contentBlocks);
-      const finalPhotoUris = readPhotoUrisFromBlocks(contentBlocks);
+      const finalPhotoUris = readPhotoUrisFromBlocks(contentBlocks).map(normalizePhotoRef);
 
       if (editingPageId) {
         const updated = await updateVoyagePage(editingPageId, {
@@ -1025,7 +1146,7 @@ export function VoyageScreen() {
   };
 
   const openEditorForPage = (page: VoyagePage) => {
-    const pageUris = page.photoUris && page.photoUris.length > 0 ? page.photoUris : page.photoUri ? [page.photoUri] : [];
+    const pageUris = (page.photoUris && page.photoUris.length > 0 ? page.photoUris : page.photoUri ? [page.photoUri] : []).map(normalizePhotoRef);
     const trailingTextId = makeBlockId();
     const blocks: EditorBlock[] = [
       { id: makeBlockId(), type: "text", value: page.note || "" },
@@ -1309,6 +1430,7 @@ export function VoyageScreen() {
                                 }}
                                 value={block.value}
                                 onFocus={() => {
+                                  setStackDeleteTargetId(null);
                                   setActiveTextBlockId(block.id);
                                   const sel = textSelectionsRef.current[block.id] ?? { start: block.value.length, end: block.value.length };
                                   insertionTargetRef.current = { id: block.id, selection: sel };
@@ -1349,80 +1471,90 @@ export function VoyageScreen() {
                                 {(() => {
                                   const panHandlers = buildStackPanHandlers(block);
                                   return (
-                                <Animated.View
-                                  {...panHandlers}
-                                  style={[
-                                    styles.inlineStackPressable,
-                                    pressingStackId === block.id && !draggingStackId ? styles.inlineStackPressing : null,
-                                    draggingStackId === block.id ? styles.inlineStackDragging : null,
-                                    {
-                                      transform: [
+                                    <Animated.View
+                                      {...panHandlers}
+                                      style={[
+                                        styles.inlineStackPressable,
+                                        pressingStackId === block.id && !draggingStackId ? styles.inlineStackPressing : null,
+                                        draggingStackId === block.id ? styles.inlineStackDragging : null,
                                         {
-                                          translateX:
-                                            draggingStackId === block.id
-                                              ? dragOffsetXAnim
-                                              : dropPreview?.id === block.id
-                                                ? dropPreview.x
-                                                : block.offsetX,
-                                        },
-                                        {
-                                          translateY:
-                                            draggingStackId === block.id
-                                              ? dragOffsetYAnim
-                                              : dropPreview?.id === block.id
-                                                ? dropPreview.y
-                                                : block.offsetY,
-                                        },
-                                        {
-                                          translateY:
-                                            draggingStackId === block.id
-                                              ? dragLiftAnim.interpolate({ inputRange: [0, 1], outputRange: [0, -24] })
-                                              : 0,
-                                        },
-                                        {
-                                          scale:
-                                            draggingStackId === block.id
-                                              ? dragLiftAnim.interpolate({ inputRange: [0, 1], outputRange: [1, 1.2] })
-                                              : 1,
-                                        },
-                                      ],
-                                    },
-                                  ]}
-                                >
-                                  <View style={styles.inlineStackCards}>
-                                    {block.uris.slice(0, 3).map((uri, stackIdx) => {
-                                      const displayUri = resolveDisplayUri(uri);
-                                      return displayUri ? (
-                                        <Image
-                                          key={`${uri}-${stackIdx}`}
-                                          source={{ uri: displayUri }}
-                                          style={[
-                                            styles.inlinePhotoPreview,
+                                          transform: [
                                             {
-                                              transform: [{ translateX: stackIdx * 10 }, { translateY: stackIdx * 2 }, { rotate: `${stackIdx * 2}deg` }],
+                                              translateX:
+                                                draggingStackId === block.id
+                                                  ? dragOffsetXAnim
+                                                  : dropPreview?.id === block.id
+                                                    ? dropPreview.x
+                                                    : block.offsetX,
                                             },
-                                          ]}
-                                        />
-                                      ) : (
-                                        <View
-                                          key={`${uri}-${stackIdx}`}
-                                          style={[
-                                            styles.inlinePhotoPreview,
-                                            styles.inlinePhotoPreviewPlaceholder,
                                             {
-                                              transform: [{ translateX: stackIdx * 10 }, { translateY: stackIdx * 2 }, { rotate: `${stackIdx * 2}deg` }],
+                                              translateY:
+                                                draggingStackId === block.id
+                                                  ? dragOffsetYAnim
+                                                  : dropPreview?.id === block.id
+                                                    ? dropPreview.y
+                                                    : block.offsetY,
                                             },
-                                          ]}
+                                            {
+                                              translateY:
+                                                draggingStackId === block.id
+                                                  ? dragLiftAnim.interpolate({ inputRange: [0, 1], outputRange: [0, -24] })
+                                                  : 0,
+                                            },
+                                            {
+                                              scale:
+                                                draggingStackId === block.id
+                                                  ? dragLiftAnim.interpolate({ inputRange: [0, 1], outputRange: [1, 1.2] })
+                                                  : 1,
+                                            },
+                                          ],
+                                        },
+                                      ]}
+                                    >
+                                      {stackDeleteTargetId === block.id ? (
+                                        <Pressable
+                                          style={styles.stackDeletePopover}
+                                          hitSlop={8}
+                                          onPress={() => removeImageStack(block.id)}
                                         >
-                                          <Ionicons name="image-outline" size={16} color="#7B8794" />
-                                        </View>
-                                      );
-                                    })}
-                                  </View>
-                                  <View style={styles.photoCountBadge}>
-                                    <Text style={styles.photoCountText}>+{block.uris.length}</Text>
-                                  </View>
-                                </Animated.View>
+                                          <Ionicons name="trash-outline" size={12} color="#FFFFFF" />
+                                          <Text style={styles.stackDeletePopoverText}>전체 삭제</Text>
+                                        </Pressable>
+                                      ) : null}
+                                      <View style={styles.inlineStackCards}>
+                                        {block.uris.slice(0, 3).map((uri, stackIdx) => {
+                                          const displayUri = resolveDisplayUri(uri);
+                                          return displayUri ? (
+                                            <Image
+                                              key={`${uri}-${stackIdx}`}
+                                              source={{ uri: displayUri }}
+                                              style={[
+                                                styles.inlinePhotoPreview,
+                                                {
+                                                  transform: [{ translateX: stackIdx * 10 }, { translateY: stackIdx * 2 }, { rotate: `${stackIdx * 2}deg` }],
+                                                },
+                                              ]}
+                                            />
+                                          ) : (
+                                            <View
+                                              key={`${uri}-${stackIdx}`}
+                                              style={[
+                                                styles.inlinePhotoPreview,
+                                                styles.inlinePhotoPreviewPlaceholder,
+                                                {
+                                                  transform: [{ translateX: stackIdx * 10 }, { translateY: stackIdx * 2 }, { rotate: `${stackIdx * 2}deg` }],
+                                                },
+                                              ]}
+                                            >
+                                              <Ionicons name="image-outline" size={16} color="#7B8794" />
+                                            </View>
+                                          );
+                                        })}
+                                      </View>
+                                      <View style={styles.photoCountBadge}>
+                                        <Text style={styles.photoCountText}>+{block.uris.length}</Text>
+                                      </View>
+                                    </Animated.View>
                                   );
                                 })()}
                               </View>
@@ -1433,14 +1565,20 @@ export function VoyageScreen() {
                           <Pressable
                             ref={photoBtnRef as any}
                             style={[styles.ghostBtn, { backgroundColor: themeColors.btnBg, borderColor: themeColors.btnBorder }]}
-                            onPress={() => void openPhotoPicker()}
+                            onPress={() => {
+                              setStackDeleteTargetId(null);
+                              void openPhotoPicker();
+                            }}
                           >
                             <Text style={[styles.ghostBtnText, { color: themeColors.btnText }]}>사진 추가</Text>
                           </Pressable>
                           <Pressable
                             ref={stampBtnRef as any}
                             style={[styles.ghostBtn, { backgroundColor: themeColors.btnBg, borderColor: themeColors.btnBorder }]}
-                            onPress={() => void openStampPicker()}
+                            onPress={() => {
+                              setStackDeleteTargetId(null);
+                              void openStampPicker();
+                            }}
                           >
                             <Text style={[styles.ghostBtnText, { color: themeColors.btnText }]}>스탬프 추가</Text>
                           </Pressable>
@@ -1851,12 +1989,12 @@ export function VoyageScreen() {
         </Pressable>
       </Modal>
 
-      <Modal visible={photoGalleryVisible} transparent animationType="fade" onRequestClose={() => setPhotoGalleryVisible(false)}>
-        <View style={styles.viewerBackdrop}>
-          <View style={styles.viewerShell}>
+      <Modal visible={photoGalleryVisible} transparent animationType="fade" onRequestClose={closePhotoViewer}>
+        <Pressable style={styles.viewerBackdrop} onPress={closePhotoViewer}>
+          <Pressable style={styles.viewerShell} onPress={(event) => event.stopPropagation()}>
             <View style={styles.viewerHeader}>
               <Text style={styles.viewerTitle}>선택한 사진 ({galleryPhotoUris.length})</Text>
-              <Pressable onPress={() => setPhotoGalleryVisible(false)}>
+              <Pressable onPress={closePhotoViewer}>
                 <Ionicons name="close" size={22} color="#F8FAFC" />
               </Pressable>
             </View>
@@ -1874,18 +2012,38 @@ export function VoyageScreen() {
                 </Pressable>
               ))}
             </ScrollView>
-          </View>
-        </View>
+          </Pressable>
+        </Pressable>
       </Modal>
-      <Modal visible={zoomPhotoVisible} transparent animationType="fade" onRequestClose={() => setZoomPhotoVisible(false)}>
-        <View style={styles.viewerBackdrop}>
-          <View style={styles.zoomShell}>
-            <Pressable style={styles.zoomCloseBtn} onPress={() => setZoomPhotoVisible(false)}>
+      <Modal
+        visible={zoomPhotoVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {
+          setZoomPhotoVisible(false);
+          setZoomPhotoUri(null);
+        }}
+      >
+        <Pressable
+          style={styles.viewerBackdrop}
+          onPress={() => {
+            setZoomPhotoVisible(false);
+            setZoomPhotoUri(null);
+          }}
+        >
+          <Pressable style={styles.zoomShell} onPress={(event) => event.stopPropagation()}>
+            <Pressable
+              style={styles.zoomCloseBtn}
+              onPress={() => {
+                setZoomPhotoVisible(false);
+                setZoomPhotoUri(null);
+              }}
+            >
               <Ionicons name="close" size={22} color="#F8FAFC" />
             </Pressable>
             {zoomPhotoUri ? <Image source={{ uri: zoomPhotoUri }} style={styles.zoomImage} /> : null}
-          </View>
-        </View>
+          </Pressable>
+        </Pressable>
       </Modal>
 
       <Modal visible={allModalVisible} transparent animationType="slide" onRequestClose={() => setAllModalVisible(false)}>
@@ -2213,6 +2371,29 @@ const styles = StyleSheet.create({
     height: 84,
     position: "relative",
   },
+  stackDeletePopover: {
+    position: "absolute",
+    top: -28,
+    left: 18,
+    zIndex: 50,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 999,
+    backgroundColor: "rgba(185,28,28,0.96)",
+    shadowColor: "#111827",
+    shadowOpacity: 0.18,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 8,
+  },
+  stackDeletePopoverText: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: "#FFFFFF",
+  },
   inlineStackCards: { width: 132, height: 84, position: "relative" },
   inlineSideInput: {
     flex: 1,
@@ -2344,6 +2525,17 @@ const styles = StyleSheet.create({
   photoSelectedMask: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: "rgba(47,102,208,0.38)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  photoRemoveChip: {
+    position: "absolute",
+    top: 6,
+    right: 6,
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: "rgba(255,255,255,0.95)",
     alignItems: "center",
     justifyContent: "center",
   },
