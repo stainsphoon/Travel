@@ -367,6 +367,10 @@ export function VoyageScreen() {
   }, [contentBlocks, galleryPhotoUris, mediaPermissionGranted, orderedPages, recentPhotos, resolvedImageMap, zoomPhotoUri]);
 
   const currentPage = orderedPages.length > 0 ? orderedPages[Math.max(0, Math.min(activePageIndex, orderedPages.length - 1))] : null;
+  const galleryResolvedPhotoUris = useMemo(
+    () => galleryPhotoUris.map((uri) => resolveDisplayUri(uri)).filter((uri): uri is string => !!uri),
+    [galleryPhotoUris, resolveDisplayUri],
+  );
 
   const displaySlideTitle = (page: VoyagePage) => {
     if (!page.title || /^Untitled Page\s+\d+$/i.test(page.title.trim())) {
@@ -1717,10 +1721,7 @@ export function VoyageScreen() {
                                     {safePhotoUris.length > 0 ? (
                                       <Pressable
                                         style={styles.savedPhotoStack}
-                                        onPress={() => {
-                                          setGalleryPhotoUris(safePhotoUris);
-                                          setPhotoGalleryVisible(true);
-                                        }}
+                                        onPress={() => openStackGallery(rawPhotoUris)}
                                       >
                                         {safePhotoUris
                                           .slice(0, 3)
@@ -1993,24 +1994,28 @@ export function VoyageScreen() {
         <Pressable style={styles.viewerBackdrop} onPress={closePhotoViewer}>
           <Pressable style={styles.viewerShell} onPress={(event) => event.stopPropagation()}>
             <View style={styles.viewerHeader}>
-              <Text style={styles.viewerTitle}>선택한 사진 ({galleryPhotoUris.length})</Text>
+              <Text style={styles.viewerTitle}>선택한 사진 ({galleryResolvedPhotoUris.length})</Text>
               <Pressable onPress={closePhotoViewer}>
                 <Ionicons name="close" size={22} color="#F8FAFC" />
               </Pressable>
             </View>
             <ScrollView contentContainerStyle={styles.viewerGrid}>
-              {galleryPhotoUris.map((uri, idx) => (
-                <Pressable
-                  key={`${uri}-${idx}`}
-                  style={styles.viewerGridItem}
-                  onPress={() => {
-                    setZoomPhotoUri(uri);
-                    setZoomPhotoVisible(true);
-                  }}
-                >
-                  <Image source={{ uri }} style={styles.viewerGridImage} />
-                </Pressable>
-              ))}
+              {galleryResolvedPhotoUris.length > 0 ? (
+                galleryResolvedPhotoUris.map((uri, idx) => (
+                  <Pressable
+                    key={`${uri}-${idx}`}
+                    style={styles.viewerGridItem}
+                    onPress={() => {
+                      setZoomPhotoUri(uri);
+                      setZoomPhotoVisible(true);
+                    }}
+                  >
+                    <Image source={{ uri }} style={styles.viewerGridImage} />
+                  </Pressable>
+                ))
+              ) : (
+                <Text style={styles.viewerEmptyText}>사진 미리보기를 준비하는 중입니다.</Text>
+              )}
             </ScrollView>
           </Pressable>
         </Pressable>
@@ -2665,6 +2670,7 @@ const styles = StyleSheet.create({
   viewerGrid: { flexDirection: "row", flexWrap: "wrap", gap: 8, paddingBottom: 8 },
   viewerGridItem: { width: 92, height: 92, borderRadius: 10, overflow: "hidden", borderWidth: 1, borderColor: "rgba(255,255,255,0.25)" },
   viewerGridImage: { width: "100%", height: "100%" },
+  viewerEmptyText: { color: "rgba(248,250,252,0.82)", fontSize: 13, lineHeight: 20, paddingVertical: 10 },
   zoomShell: {
     width: "92%",
     height: "76%",
